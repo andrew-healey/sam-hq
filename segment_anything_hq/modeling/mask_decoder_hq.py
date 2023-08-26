@@ -105,6 +105,8 @@ class MaskDecoderHQ(nn.Module):
         multimask_output: bool,
         hq_token_only: bool,
         interm_embeddings: torch.Tensor,
+        hq_features: torch.Tensor,
+        token_slice: slice,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -121,8 +123,11 @@ class MaskDecoderHQ(nn.Module):
           torch.Tensor: batched predicted masks
           torch.Tensor: batched predictions of mask quality
         """
-        vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
-        hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
+
+        assert interm_embeddings is None,"interm_embeddings is deprecated"
+
+        # vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
+        # hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
 
         masks, iou_pred = self.predict_masks(
             image_embeddings=image_embeddings,
@@ -130,12 +135,13 @@ class MaskDecoderHQ(nn.Module):
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
             hq_features=hq_features,
+            token_slice=token_slice,
         )
 
         # Select the correct mask or masks for output
         if multimask_output:
             # mask with highest score
-            mask_slice = slice(1,self.num_mask_tokens-1)
+            mask_slice = token_slice(1,self.num_mask_tokens-1)
             iou_pred = iou_pred[:, mask_slice]
             iou_pred, max_iou_idx = torch.max(iou_pred,dim=1)
             iou_pred = iou_pred.unsqueeze(1)
@@ -143,11 +149,11 @@ class MaskDecoderHQ(nn.Module):
             masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)
         else:
             # singale mask output, default
-            mask_slice = slice(0, 1)
+            mask_slice = token_slice(0, 1)
             iou_pred = iou_pred[:,mask_slice]
             masks_sam = masks[:,mask_slice]
 
-        masks_hq = masks[:,slice(self.num_mask_tokens-1, self.num_mask_tokens)]
+        masks_hq = masks[:,token_slice(self.num_mask_tokens-1, self.num_mask_tokens)]
         if hq_token_only:
             masks = masks_hq
         else:
@@ -162,6 +168,7 @@ class MaskDecoderHQ(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         hq_features: torch.Tensor,
+        token_slice: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -187,8 +194,13 @@ class MaskDecoderHQ(nn.Module):
         upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat(b,1,1,1)
 
         hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_mask_tokens):
-            if i < self.num_mask_tokens - 1:
+        num_lqs = 0
+
+        for i in range(self.num_mask_tokens)[token_slice]:
+
+            is_lq = i < self.num_mask_tokens - 1
+            if is_lq:
+                num_lqs += 1
                 hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
             else:
                 hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
@@ -196,13 +208,16 @@ class MaskDecoderHQ(nn.Module):
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding_sam.shape
 
-        masks_sam = (hyper_in[:,:self.num_mask_tokens-1] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
-        masks_sam_hq = (hyper_in[:,self.num_mask_tokens-1:] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
-        masks = torch.cat([masks_sam,masks_sam_hq],dim=1)
-        # Generate mask quality predictions
-        iou_pred = self.iou_prediction_head(iou_token_out)
+        lq_masks_sam = (hyper_in[:num_lqs] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
+        hq_masks_sam = (hyper_in[num_lqs:] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
 
-        return masks, iou_pred
+        masks = torch.cat([lq_masks_sam,hq_masks_sam],dim=1)
+        # Generate mask quality predictions
+        iou_pred = self.iou_prediction_head(iou_token_out)[token_slice]
+        lq_iou_pred = iou_pred[:, :num_lqs]
+        hq_iou_pred = iou_pred[:, num_lqs:]
+
+        return lq_masks_sam,hq_masks_sam, lq_iou_pred, hq_iou_pred
 
 
 # Lightly adapted from

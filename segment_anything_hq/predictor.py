@@ -88,7 +88,15 @@ class SamPredictor:
         self.original_size = original_image_size
         self.input_size = tuple(transformed_image.shape[-2:])
         input_image = self.model.preprocess(transformed_image)
-        self.features, self.interm_features = self.model.image_encoder(input_image)
+        self.features, interm_features = self.model.image_encoder(input_image)
+
+        # calculate hq_features
+        # interm_features = torch.stack(interm_features)
+        vit_features = interm_features[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
+        hq_features = self.model.mask_decoder.embedding_encoder(self.features) + self.model.mask_decoder.compress_vit_feat(vit_features)
+        self.hq_features = hq_features
+        self.interm_features = None # deprecated, so set to None
+
         self.is_image_set = True
 
     def predict(

@@ -97,6 +97,7 @@ class SamOnnxModel(nn.Module):
         self,
         image_embeddings: torch.Tensor,
         interm_embeddings: torch.Tensor,
+        hq_features: torch.Tensor,
         point_coords: torch.Tensor,
         point_labels: torch.Tensor,
         mask_input: torch.Tensor,
@@ -106,42 +107,50 @@ class SamOnnxModel(nn.Module):
         sparse_embedding = self._embed_points(point_coords, point_labels)
         dense_embedding = self._embed_masks(mask_input, has_mask_input)
 
-        vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
-        hq_features = self.model.mask_decoder.embedding_encoder(image_embeddings) + self.model.mask_decoder.compress_vit_feat(vit_features)
+        # calculate token slices
+        token_slice = [] # use a list of indices
+        if self.multimask_output:
+            token_slice += list(range(1,self.model.mask_decoder.num_mask_tokens-1)) # 3-scale mask tokens
+        else:
+            token_slice += [0] # single-mask token
+        
+        if self.hq_token_only:
+            token_slice = []
+        token_slice += [self.model.mask_decoder.num_mask_tokens-1] # hq token
 
-        masks, scores = self.model.mask_decoder.predict_masks(
+        assert interm_embeddings is None,"interm_embeddings is deprecated"
+        # vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
+        # hq_features = self.model.mask_decoder.embedding_encoder(image_embeddings) + self.model.mask_decoder.compress_vit_feat(vit_features)
+
+        lq_masks,hq_masks, lq_scores,hq_scores = self.model.mask_decoder.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=self.model.prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embedding,
             dense_prompt_embeddings=dense_embedding,
             hq_features=hq_features,
+            slice=slice,
         )
 
         if self.use_stability_score:
-            scores = calculate_stability_score(
-                masks, self.model.mask_threshold, self.stability_score_offset
+            lq_scores = calculate_stability_score(
+                lq_masks, self.model.mask_threshold, self.stability_score_offset
             )
+            hq_scores = calculate_stability_score(
+                hq_masks, self.model.mask_threshold, self.stability_score_offset
+            )
+        
+        masks = hq_masks
+        scores = hq_scores
 
-        if self.multimask_output:
-            # mask with highest score
-            mask_slice = slice(1,self.model.mask_decoder.num_mask_tokens-1)
-            scores = scores[:, mask_slice]
-            scores, max_iou_idx = torch.max(scores,dim=1)
-            scores = scores.unsqueeze(1)
-            masks_multi = masks[:, mask_slice, :, :]
-            masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)
-        else:
-            # singale mask output, default
-            mask_slice = slice(0, 1)
-            scores = scores[:,mask_slice]
-            masks_sam = masks[:,mask_slice]
-
-        masks_hq = masks[:,slice(self.model.mask_decoder.num_mask_tokens-1, self.model.mask_decoder.num_mask_tokens)]
-
-        if self.hq_token_only:
-            masks = masks_hq
-        else:
-            masks = masks_sam + masks_hq
+        if not self.hq_token_only:
+            if self.multimask_output:
+                lq_scores, max_iou_idx = torch.max(lq_scores,dim=1)
+                lq_scores = lq_scores.unsqueeze(1)
+                lq_masks_sam = lq_masks[torch.arange(lq_masks.size(0)),max_iou_idx].unsqueeze(1)
+            else:
+                lq_masks_sam = lq_masks
+            masks = torch.cat([lq_masks_sam,masks],dim=1)
+            scores = torch.cat([lq_scores,scores],dim=1)
 
         upscaled_masks = self.mask_postprocessing(masks, orig_im_size)
 
